@@ -208,17 +208,30 @@ class MockClient(ChatClient):
         latency_ms = 140 + 9.0 * params.get("max_tokens", 1) + 30 * n + rng.uniform(0, 40)
         await asyncio.sleep(latency_ms / 1000.0)
 
-        # Deterministic seeded error injection so the dry-run report is non-degenerate.
+        # Deterministic seeded error injection with calibrated confidence:
+        # correct calls get large label separation, wrong calls small, so
+        # reconstructed softmax confidence tracks correctness and the
+        # correlation tables are non-degenerate.
         pid = int(_prompt_id(prompt)[:8], 16)
-        error_rate = 0.15 if autoregressive else (0.04 if constrained else 0.08)
+        temperature = params.get("temperature", 0.0)
+        if autoregressive:
+            error_rate = 0.15
+        elif temperature >= 0.5:
+            error_rate = 0.22               # per-vote rate at sampling temperature
+        elif constrained:
+            error_rate = 0.05
+        else:
+            error_rate = 0.10
 
         outs = []
         for k in range(n):
-            flip = random.Random(f"{pid}-{k}").random() < error_rate
-            label = rng.choice([c for c in choices if c != gold] or choices) if flip else gold
-            prob = rng.uniform(0.05, 0.3) if flip else rng.uniform(0.75, 0.99)
+            vrng = random.Random(f"{pid}-{k}")
+            flip = vrng.random() < error_rate
+            label = vrng.choice([c for c in choices if c != gold] or choices) if flip else gold
+            prob = vrng.uniform(0.3, 0.7) if flip else vrng.uniform(0.85, 0.99)
+            gap = vrng.uniform(0.3, 1.8) if flip else vrng.uniform(2.5, 9.0)
             content = label
-            if autoregressive and not flip and rng.random() < 0.25:
+            if autoregressive and not flip and vrng.random() < 0.25:
                 content = f"**{label}**"   # inject format errors into autoreg
             outs.append({
                 "message": {"content": content},
@@ -226,17 +239,17 @@ class MockClient(ChatClient):
                     "token": content, "logprob": math.log(prob),
                     # Mass follows the emitted label, so single-pass shows errors
                     # when they are injected and its correlation table is defined.
-                    "top_logprobs": _mock_top_logprobs(choices, label, math.log(prob), rng),
+                    "top_logprobs": _mock_top_logprobs(choices, label, math.log(prob), gap, vrng),
                 }]},
             })
         return {"choices": outs}, latency_ms
 
 
-def _mock_top_logprobs(choices, picked, picked_lp, rng) -> list[dict]:
+def _mock_top_logprobs(choices, picked, picked_lp, gap, rng) -> list[dict]:
     entries = [{"token": picked, "logprob": picked_lp}]
     for c in choices:
         if c != picked:
-            entries.append({"token": c, "logprob": picked_lp - rng.uniform(1.5, 9.0)})
+            entries.append({"token": c, "logprob": picked_lp - gap - rng.uniform(0.0, 1.5)})
     return entries
 
 
@@ -699,7 +712,8 @@ def build_report(cfg: Config, summaries: list[Summary]) -> str:
     lines.append("")
     lines.append("Correlation is computed against binary correctness (1 = matches gold). "
                  "ECE = expected calibration error, lower is better. For self-consistency the "
-                 "\"confidence\" is the vote-agreement fraction, not a token probability.")
+                 "\"confidence\" is the vote-agreement fraction, not a token probability. "
+                 "n/a = correlation undefined (correctness constant, e.g. every call correct).")
     lines.append("")
 
     # ---- Table 4: latency/accuracy ladder across all strategies
