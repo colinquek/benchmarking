@@ -220,5 +220,5 @@ __marimo__/
 .streamlit/secrets.toml
 
 # output
-report.md
-results.json
+*report.md
+*results.json
